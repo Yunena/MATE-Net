@@ -1,2 +1,4 @@
 # MATE-Net
-MATE-Net code
+
+## Introduction
+This repository includes the implementation of Multimodal and ATtention-based Expansion Network (MATE-Net). 
