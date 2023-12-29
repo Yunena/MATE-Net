@@ -1,11 +1,13 @@
+#extra attention module
+
 import math
 from functools import partial
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from models.cbam import AttnConvBlock
+from utils.resample import re_sample
 
 
 def get_inplanes():
@@ -32,23 +34,33 @@ def conv1x1x1(in_planes, out_planes, stride=1):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes,stride=1, downsample=None):
+    def __init__(self, in_planes, planes, stride=1, downsample=None, clinical_num=0, idx = 0):
         super().__init__()
-
         self.conv1 = conv3x3x3(in_planes, planes, stride)
         self.bn1 = nn.BatchNorm3d(planes)
         self.relu = nn.ReLU(inplace=True)
-        #self.attn = AttnConvBlock(planes,input_layer,input_height,input_width,patch_layer,patch_height,patch_width)
-
         self.conv2 = conv3x3x3(planes, planes)
-        self.bn2 = nn.BatchNorm3d(planes)
         self.attn = AttnConvBlock(planes)
-        self.relu_ = nn.ReLU(inplace=True)
+        self.bn2 = nn.BatchNorm3d(planes)
         self.downsample = downsample
         self.stride = stride
+        self.idx = idx
+        self.relu_ = nn.ReLU(inplace=True)
 
-    def forward(self, x):
+    def forward(self,x):
+        #print('OK')
+        y=None
+        ca=None
+        sa=None
+        #print(type(x))
+        if isinstance(x,tuple):
+            #print(len(x))
+            x, y, ca, sa = x
+            #print(x.size(),y.size(),sa.size())
+
+
         residual = x
+        #print(ca,sa)
 
         out = self.conv1(x)
         out = self.bn1(out)
@@ -56,24 +68,39 @@ class BasicBlock(nn.Module):
 
         out = self.conv2(out)
         out = self.bn2(out)
+
+
+
         out = self.attn(out)
+
+
+
 
         if self.downsample is not None:
             residual = self.downsample(x)
 
-        out += residual
-        out = self.relu_(out)
+        if sa is not None:
+            #print(out.size())
+            if out.size()[1]==residual.size()[1]:
+                out+=residual
+            else:
+                out[:,0:512]+=residual
+            return out, y, ca, sa
+        else:
+            out += residual
+            out = self.relu_(out)
+            return out
 
-        return out
+
 
 
 class Bottleneck(nn.Module):
     expansion = 4
 
-    def __init__(self, in_planes, planes, stride=1, downsample=None):
+    def __init__(self, in_planes, planes, stride=1, downsample=None, clinical_num=0, idx = 0):
         super().__init__()
 
-        self.conv1 = conv1x1x1(in_planes, planes)
+        self.conv1 = conv1x1x1(in_planes*(clinical_num+1), planes)
         self.bn1 = nn.BatchNorm3d(planes)
         self.conv2 = conv3x3x3(planes, planes, stride)
         self.bn2 = nn.BatchNorm3d(planes)
@@ -82,8 +109,15 @@ class Bottleneck(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
+        self.idx = idx
+        self.relu_ = nn.ReLU(inplace=True)
 
     def forward(self, x):
+        ca=None
+        sa=None
+        if isinstance(x,tuple):
+            x, ca, sa = x
+
         residual = x
 
         out = self.conv1(x)
@@ -97,13 +131,29 @@ class Bottleneck(nn.Module):
         out = self.conv3(out)
         out = self.bn3(out)
 
+        outlist = []
+        outlist.append(out)
+
+        if ca is not None:
+            cai = ca[:,self.idx]
+            for i in range(len(out)):
+                outlist.append(cai[i]*out[i])
+        if sa is not None:
+            sai = sa[:,self.idx]
+            for i in range(1,len(outlist)):
+                outlist[i] = sai[i]*outlist[i]
+
         if self.downsample is not None:
             residual = self.downsample(x)
 
         out += residual
-        out = self.relu(out)
+        outlist[0] = out
 
-        return out
+        outlist = torch.stack(tuple(outlist),dim=1)
+
+
+        outlist = self.relu_(outlist)
+        return outlist
 
 
 class ResNet(nn.Module):
@@ -118,27 +168,28 @@ class ResNet(nn.Module):
                  no_max_pool=False,
                  shortcut_type='B',
                  widen_factor=1.0,
-                 n_classes=400):
+                 n_classes=1,
+                 clinical_num = 0):
         super().__init__()
 
         block_inplanes = [int(x * widen_factor) for x in block_inplanes]
 
         self.in_planes = block_inplanes[0]
         self.no_max_pool = no_max_pool
+        #self.attn = AttnConvBlock(n_input_channels)
 
-        self.conv1 = nn.Conv3d(n_input_channels,
-                               self.in_planes,
-                               kernel_size=(conv1_t_size, 7, 7),
-                               stride=(conv1_t_stride, 2, 2),
-                               padding=(conv1_t_size // 2, 3, 3),
-                               bias=False)
-        self.bn1 = nn.BatchNorm3d(self.in_planes)
+
+        self.conv1 = conv1x1x1(n_input_channels if n_input_channels>0 else 1,32,stride=(1,2,2))
+        self.bn1 = nn.BatchNorm3d(32)
+        self.conv2 = conv1x1x1(32,self.in_planes)
+        self.bn2 = nn.BatchNorm3d(self.in_planes)
+        self.conv3 = conv1x1x1(self.in_planes,32)
+        self.bn3 = nn.BatchNorm3d(32)
+
+        self.attn = nn.Sequential(AttnConvBlock(in_planes=n_input_channels + clinical_num))
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
-
-        #self.attn = nn.Sequential(AttnConvBlock(in_planes=n_input_channels))
         self.layer1 = self._make_layer(block, block_inplanes[0], layers[0],
-                                       shortcut_type)
+                                       shortcut_type,input_num=n_input_channels+clinical_num)
         self.layer2 = self._make_layer(block,
                                        block_inplanes[1],
                                        layers[1],
@@ -178,7 +229,10 @@ class ResNet(nn.Module):
 
         return out
 
-    def _make_layer(self, block, planes, blocks, shortcut_type, stride=1):
+    def _make_layer(self, block, planes, blocks, shortcut_type, stride=1, clinical_num = 0, input_num=0):
+        #in_planes = self.in_planes
+        if input_num>0:
+            self.in_planes = input_num
         downsample = None
         if stride != 1 or self.in_planes != planes * block.expansion:
             if shortcut_type == 'A':
@@ -195,21 +249,20 @@ class ResNet(nn.Module):
             block(in_planes=self.in_planes,
                   planes=planes,
                   stride=stride,
-                  downsample=downsample))
+                  downsample=downsample,
+                  clinical_num=clinical_num,
+                  idx = 0))
         self.in_planes = planes * block.expansion
         for i in range(1, blocks):
-            layers.append(block(self.in_planes, planes))
+            layers.append(block(self.in_planes, planes,clinical_num=clinical_num, idx = i))
 
         return nn.Sequential(*layers)
 
-    def forward(self, x):
-        #x = self.attn(x)
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        if not self.no_max_pool:
-            x = self.maxpool(x)
+    def forward(self, x,sa=None):
+        if sa is not None:
+            x = torch.cat((x,sa),dim=1)
 
+        x = self.attn(x)
         x = self.layer1(x)
         x = self.layer2(x)
         x = self.layer3(x)
@@ -243,5 +296,8 @@ def generate_model(model_depth, **kwargs):#for filter
         model = ResNet(Bottleneck, [3, 24, 36, 3], get_inplanes(), **kwargs)
 
     return model
+
+
+
 
 
