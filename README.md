@@ -21,7 +21,8 @@ The implementation was based on Python 3.8 and the following dependencies:
 
 ## Documentation
 *wrapper.py* contains the interfaces for training, evaluation and interpretability analysis. 
-*main.py* covers the code below. 
+
+#### *main.py* covers the code below. 
 ### 1. Initialize a model
 ```python
 from models.mate_net import *
