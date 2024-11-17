@@ -1,164 +1,213 @@
-from trainer import RegressionTraining
-from interpreter import Interpreting
 from models.mate_net import *
-from utils.model_load import load_model
-from utils.evaluation import reg_evaluation,prc_evaluation
-from utils.resample import re_sample
-from utils.data_load import HybridDataset
+from utils.model_save import dataparalell_save
+from utils.data_load import MATENetDataset
 
+from utils.early_stop import EarlyStop
+from utils.model_load import load_model
+import torchmetrics
 import os
-import copy
-import pandas as pd
 import torch
 import torch.utils.data as Data
 import torch.nn as nn
 import json
 import shap
+import numpy as np
 
 from tqdm import tqdm
-
+from torch.optim import lr_scheduler
 torch.backends.cudnn.enabled = False
 
 
 
 class Model():
-	def __init__(self,jsonfile,devices,task='train',split_num = 0.8,
-			  image_list = ['AP.nii', 'AP2.nii', 'CTP0.nii', 'CBV.nii.gz', 'CBF.nii.gz', 'Tmax.nii.gz', 'mttv.nii.gz'],
-			  aug_time=10,batch_size=32,num_worker=4):
-		self.task = task
-		if task == 'train':
-			self.trainer = RegressionTraining(
-							jsonfile=jsonfile,
-							train_test_split_num=split_num,
-							image_list=image_list,
-							aug_time=aug_time,
-							gpu_devices=devices,
-							batch_size=(int)(batch_size/len(devices.split(','))),
-							num_workers=num_worker)
+	def __init__(self,device,save_path = None,model_type = 'pred',is_evaluate = False):
+		assert model_type in ['attn','pred']
+		self.aim_shape = (8,32,32)
+		self.device = device
+		self.save_path = save_path
+		self.model_type = model_type
+		self.clinical_idx = 0
+		self.is_evaluate = is_evaluate
+		self.es = EarlyStop()
 
+		pass
 
-		self.jsonfile = jsonfile
-		self.image_list = image_list
-		self.devices = devices
-    
-	def kfold_train(self,attn_model,pred_model,epoch,value_path,start_idx,training_type,include_list=None,clinical_num=13,kvalue=5):
-		if self.task == 'train':
-			for i in range(start_idx,start_idx+kvalue):
-				if not os.path.exists(os.path.join(value_path,str(i))):
-					os.mkdir(os.path.join(value_path,str(i)))
+	def get_dataloader(self,image_idx_list,image_path,mask_path,minmax_clinical_data,clinical_num,device,
+					attn_model_path=None,zscored_clinical_data=None,pred_result_data=None,
+					batch_size = 12,num_workers=4,shuffle=False):
+		data_set = MATENetDataset(
+			model_type=self.model_type,
+			image_idx_list=image_idx_list,
+			image_path = image_path,
+			mask_path = mask_path,
+			minmax_clinical_data = minmax_clinical_data,
+			clinical_num=clinical_num,
+			device=device,
+			attn_model_path=attn_model_path,
+			zscored_clinical_data = zscored_clinical_data,
+			pred_result_data=pred_result_data
+		)
+		data_loader = Data.DataLoader(
+            dataset=data_set,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle=shuffle,
+        )
+		return data_loader
+		
 
-			self.trainer.kfold_training(
-				attnmodel=attn_model,
-				predmodel=pred_model,
-				EPOCH=epoch,
-				value_path=value_path,
-				start_idx = start_idx,
-				clinical_num=clinical_num,
-				training_type=training_type,
-				include_list=list(range(clinical_num)) if include_list is None else include_list,
-				kvalue=kvalue
-			)
+	def train(self,epoch,model,data_loader,eval_data_loader = None):
+		device = self.device
+		model = torch.nn.DataParallel(model, device_ids=[0])
+		self.es.initialize()
+		if self.model_type=='attn':
+			loss_func = nn.MSELoss()
+			opti = torch.optim.Adam(model.parameters(), lr=1e-6)
 		else:
-			print('Not in training stage.')
+			loss_func = nn.SmoothL1Loss()
+			opti = torch.optim.Adam(model.parameters(), lr=1e-5)
 
-	def evaluate(self,attn_model,pred_model,value_path,training_type,start_idx,result_path,kvalue=5):
-		image_list = self.image_list
-		jsonfile = self.jsonfile
+		for e in range(epoch):
+			train_loss, predictions, results = self.train_one_epoch(model,data_loader,opti,loss_func,device)
+			if self.model_type=='pred':
+				print(train_loss,self.evaluate(predictions,results))
+			if eval_data_loader is not None:
+				test_loss, predictions, results = self.validate_in_train(model,eval_data_loader,loss_func,device)
+				if self.model_type=='attn' and self.es.attn_check_stop(test_loss):
+					dataparalell_save(model,os.path.join(self.save_path,'attn_module'+'_'+str(self.clinical_idx)+'.pkl'))
+				elif self.model_type == 'pred' and self.es.check_stop(test_loss):	
+					print(test_loss,self.evaluate(predictions,results))
+					dataparalell_save(model,os.path.join(self.save_path,'pred_module.pkl'))
+					np.save(os.path.join(self.save_path,'validate_predictions.npy'),predictions.detach().cpu().numpy())
+			else:
+				if self.model_type=='attn':
+					dataparalell_save(model,os.path.join(self.save_path,'attn_module'+'_'+str(self.clinical_idx)+'.pkl'))
+				elif self.model_type == 'pred':	
+					dataparalell_save(model,os.path.join(self.save_path,'pred_module.pkl'))
 
-		with open(jsonfile, 'r', encoding='utf8') as fp:
-			data = json.load(fp)
-		IMAGE_PATH = data['IMAGE_PATH']
-		NORM_IMAGE_PATH = data['NORM_IMAGE_PATH']
-		CLINICAL_PATH = data['CLINICAL_PATH']
-		RESULT_PATH = data['RESULT_PATH']
-		IMAGE_IDX_PATH = data['IMAGE_IDX_PATH']
-		DATA_LENGTH = data['DATA_LENGTH']
-		IMAGE_LIST = image_list
-		modelpath = 'best_'+training_type + '_model.pkl'
+	def validate(self,model,data_loader,device):
+		model = load_model(model,os.path.join(self.save_path,'pred_module.pkl'))
+		model = torch.nn.DataParallel(model, device_ids=[0])
+		model.to(device)
+		model.eval()
+		predictions = []
+		results = []
+		for step,sample in enumerate(data_loader):
+			i_x = sample["image"]
+			if self.model_type == 'pred':
+				r_x = sample["result"]
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				c_x = sample["asced"]
+				c_x = c_x.to(device)
+				o_x = model(i_x,c_x)
+			else:
+				r_x = sample["result"][:,self.clinical_idx].unsqueeze(1)
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				o_x = model(i_x)
+			predictions.append(o_x.cpu())
+		predictions = torch.cat(predictions)
+		results = torch.cat(results)
+		if self.is_evaluate:
+			print(self.evaluate(predictions,results))
+		return predictions, results
 
-		idx_list = list(range(DATA_LENGTH))
+	def validate_in_train(self,model,data_loader,loss_func,device):
+		model.eval()
+		total_loss = 0
+		predictions = []
+		results = []
+		for step,sample in enumerate(data_loader):
+			i_x = sample["image"]
+			if self.model_type == 'pred':
+				r_x = sample["result"]
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				c_x = sample["asced"]
+				c_x = c_x.to(device)
+				o_x = model(i_x,c_x)
+			else:
+				r_x = sample["result"][:,self.clinical_idx].unsqueeze(1)
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				o_x = model(i_x)
+			loss = loss_func(o_x, r_x)
+			predictions.append(o_x.cpu())
+			total_loss += float(loss.data.cpu().numpy())
+		predictions = torch.cat(predictions)
+		results = torch.cat(results)
+		if self.is_evaluate:
+			print(self.evaluate(predictions,results))
+		return total_loss/(step+1), predictions, results
+
+	def train_one_epoch(self,model,data_loader,optimizer,loss_func,device):
+		model.train()
+		total_loss = 0
+		predictions = []
+		results = []
+		for step,sample in enumerate(tqdm(data_loader)):
+			i_x = sample["image"]
+			if self.model_type == 'pred':
+				r_x = sample["result"]
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				c_x = sample["asced"]
+				c_x = c_x.to(device)
+				o_x = model(i_x,c_x)
+			else:
+				r_x = sample["result"][:,self.clinical_idx].unsqueeze(1)
+				results.append(r_x)
+				i_x, r_x = i_x.to(device), r_x.to(device)
+				o_x = model(i_x)
+			loss = loss_func(o_x, r_x)
+			loss.backward()
+			predictions.append(o_x.cpu())
+			optimizer.step()
+			total_loss += float(loss.data.cpu().numpy())
+		predictions = torch.cat(predictions)
+		results = torch.cat(results)
+		return total_loss/(step+1), predictions, results
+
+	def evaluate(self,predictions,results):
+		predictions = predictions.cpu()
+		results = results.cpu()
+		predictions = torch.round(predictions).int()
+		float_predictions = torch.round(predictions)/6
+		results = results.int()
+		predictions[predictions<3]=0
+		predictions[predictions>2]=1
+		results[results<3] = 0
+		results[results>2] = 1
+		biacc = torchmetrics.Accuracy('binary')
+		auc = torchmetrics.AUROC(task = 'binary')
+		pre = torchmetrics.Precision(task = 'binary')
+		cm = torchmetrics.ConfusionMatrix(task = 'binary',num_classes=2)
+		biacc_r = biacc(predictions,results)
+		auc_r = auc(float_predictions,results)
+		ppv_r = pre(predictions,results)
+		cm_r = cm(predictions,results)
+		npv_r = cm_r[0][0]/torch.sum(cm_r,axis=0)[0] if cm_r[0][0]!=0 else cm_r[0][0]
 
 
-		for idx_ in range(start_idx,start_idx+kvalue):
-			model_idx = str(idx_)
-			model = copy.deepcopy(pred_model)
-			model = load_model(model,os.path.join(value_path, model_idx, modelpath))
-			split_path = os.path.join(value_path, model_idx+'/split_list.txt')
-			with open(split_path) as f:
-				str1 = f.readline()[1:-2]
-				str2 = f.readline()[1:-1]
-				list1 = str1.replace(',', ' ').split()
-				list2 = str2.replace(',', ' ').split()
-				list1 = [int(i) for i in list1]
-				list2 = [int(i) for i in list2]
-				print(list1, list2)
+		return biacc_r, auc_r, ppv_r, npv_r
 
+	def interprete(self,model,base_loader,data_loader):
+		device = self.device
+		model = torch.nn.DataParallel(model, device_ids=[0])
+		model.eval()
+		model = model.to(device)
+		x = None
+		for base in base_loader:
+			x = [base["image"].to(device),base["asced"].to(device)]
+		explainer = shap.DeepExplainer(model, x)
+		values = []
+		for data in data_loader:
+			x = [data["image"].to(device),data["asced"].to(device)]
+			value = explainer.shap_values(x)
+			values.append(np.concatenate(value,axis=1))
+		return np.concatenate(values,axis=0)
+		
 
-			test_dataset = HybridDataset(
-							idx_list = idx_list,
-							image_idx_list=IMAGE_IDX_PATH,
-							image_path=IMAGE_PATH,
-							norm_image_path=NORM_IMAGE_PATH,
-							image_list=IMAGE_LIST,
-							clinical_path=CLINICAL_PATH,
-							result_path=RESULT_PATH,
-							attn_model=attn_model,
-							aug_time=1,
-							pred=True,
-							model_path=os.path.join(value_path,model_idx)
-						)
-
-			test_loader = Data.DataLoader(
-							dataset=test_dataset,
-							batch_size=32,num_workers=4)
-
-
-			net = torch.nn.DataParallel(model, device_ids=[0])
-			net.eval()
-			net = net.cuda()
-			test_target = []
-			test_preds = []
-			
-
-			for idx,i in enumerate(tqdm(test_loader)):
-				img = re_sample(i['image'],(8,32,32)).cuda()
-				asced = re_sample(i['asced'],(8,32,32)).cuda()
-				clinical = i['clinical'].cuda()
-				target = i['result'].cuda()
-				with torch.no_grad():
-					test_target.append(target)
-					test_preds.append(net(img, asced))
-
-			test_target = torch.cat(test_target, dim=0).cpu()
-			test_preds = torch.cat(test_preds, dim=0).cpu()
-
-			file = os.path.join(value_path,model_idx,result_path)
-			evas = reg_evaluation(test_preds,test_target)
-			prcs = prc_evaluation(test_preds,test_target)
-			with open(file, 'w') as f:
-				for eva in evas:
-					f.write(str(eva)+'\t')
-				for prc in prcs:
-					f.write(str(prc)+'\t')
-				f.write('\n')
-
-	def interprete(self,attn_model,pred_model,value_path,start_idx,training_type,kvalue=1,clinical_num=13,include_list=None,exterjsonfile=None,exter_image_list=None):
-		for idx in range(start_idx,start_idx+kvalue):
-			inter = Interpreting(
-				attn_model=attn_model,
-				value_path=value_path,
-				idx=idx,
-				jsonfile=self.jsonfile,
-				devices=self.devices,
-				clinical_num=clinical_num,
-				image_list=self.image_list,
-				include_list=include_list,
-				exterjsonfile=exterjsonfile,
-				exter_image_list=exter_image_list
-			)
-			inter.shap_interprete(
-				pred_model=pred_model,
-				training_type=training_type,
-			)
 
 	

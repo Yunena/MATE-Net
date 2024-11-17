@@ -19,110 +19,41 @@ The implementation was based on Python 3.8 and the following dependencies:
 10. torchmetrics==0.11.4 
 11. tqdm==4.65.0 
 
+## *** LATEST UPDATE ***
+The code has been updated and optimized for clarity and conciseness, eliminating redundancies. To facilitate testing, inputs and labels are randomly generated using *get_example.py* to simulate the workflow.
+
 ## Documentation
 *wrapper.py* contains the interfaces for training, evaluation and interpretability analysis. 
 
-#### *main.py* covers the code below. 
-### 1. Initialize a model
-```python
-from models.mate_net import *
+The code is designed to run on GPU by default.
 
-attn_model = AttentionModule(
-    input_num = 7                       # CT images quantity
-)
-pred_model = PredictionModule(
-    clinical_num = 13,                  # Clinical data quantity
-    input_num = 7                       # CT images quantity
-)
-
+### 1 Example Data Generation
+```
+python get_example.py
 ```
 
+20 data for training and 5 data for validation
 
-### 2. Train a model
-```python
-from models.mate_net import *
-from wrapper import Model
-
-model = Model(
-    jsonfile='jsonfiles/jsonfile',      # dataset and general configuration for the experiment
-    devices=0                           # GPU device id
-)
-
-
-
-model.kfold_train(                      # choose k-fold stratege
-    attn_model=attn_model,              # AttentionModule
-    pred_model=pred_model,              # PredictionModule
-    epoch=80,                           # training epoch
-    value_path='results',               # results saving path (model path)
-    start_idx=0,                        # the start saving path for the following k-fold
-    training_type='multimodal',         # model type
-    kvalue=5                            # 5-fold
-)
-
+### 2 Attention Module Training
 ```
-### 3. Evaluate a model
-```python
-from models.mate_net import *
-from wrapper import Model
-
-model = Model(
-    jsonfile='jsonfiles/jsonfile',      # dataset and general configuration for the experiment
-    devices=0                           # GPU device id
-)
-
-model.evaluate(
-    attn_model=attn_model,              # AttentionModule
-    pred_model=pred_model,              # PredictionModule
-    value_path='results',               # results saving path (model path)
-    training_type='multimodal',         # model type
-    start_idx=0,                        # the start saving path for the following k-fold
-    result_path='bmultimodaleval.txt',  # saving path
-    kvalue=1                            # number of models
-)
-
+python attn_train.py
 ```
 
-### 4. Analyze model interpretability
-Here the method is for SHAP maps generation. 
-```python
-from models.mate_net import *
-from wrapper import Model
-
-model = Model(
-    jsonfile='jsonfiles/jsonfile',      # dataset and general configuration for the experiment
-    devices=0                           # GPU device id
-)
-
-model.interprete(
-    attn_model=attn_model,              # AttentionModule
-    pred_model=pred_model,              # PredictionModule
-    value_path='results',               # results saving path (model path)
-    start_idx=0,                        # the start saving path for the following k-fold
-    training_type='multimodal',         # model type
-    kvalue=1                            # number of models
-)
+### 3 Prediction Module Training
+```
+python pred_train.py
 ```
 
-### 5. C-SHAP Generation
-*interpretability.py* implements interpretability methods. 
-```python
-from interpreter import Interpreting
-
-inter = Interpreting(
-    attn_model=attn_model,              # AttentionModule
-    value_path='results',               # results saving path (model path)
-    idx=0,                              # the start saving path for the following k-fold
-    jsonfile='jsonfiles/jsonfile',      # dataset and general configuration for the experiment
-    devices=0,                          # GPU device id
-    inte_type='cshap',                  # interpretability type
-)
-
-inter.get_cshap(
-    name1='multimodal_values0.npy',     # shap map saving path
-    save_path='cshap.npy',              # generated cshap saving path
-    )
+### 4 Prediction Module Validation
 ```
+python pred_validate.py
+```
+
+### 5 SHAP Interpretion and C-SHAP generation
+```
+python pred_interprete.py
+```
+
 
 ## DEMO
 The C-SHAP values for the four individuals in Figure. 5 in the text are presented in the *demo* folder.
